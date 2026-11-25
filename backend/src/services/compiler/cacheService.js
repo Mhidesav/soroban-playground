@@ -391,9 +391,12 @@ export class CompilationCacheService {
         // Digest failure or S3 miss — evict stale Redis entry
         if (wasmBytes) {
           this._digestFailures++;
-          console.warn(
-            `[cacheService] Digest mismatch from Redis/S3 for hash ${hash}; evicting`
-          );
+          const redisMismatchMessage = [
+            '[cacheService] Digest mismatch from Redis/S3 for hash',
+            hash,
+            '; evicting',
+          ].join(' ');
+          console.warn(redisMismatchMessage);
         }
         await this.evict(hash);
         this._misses++;
@@ -430,9 +433,11 @@ export class CompilationCacheService {
 
         if (entry && wasmBytes) {
           this._digestFailures++;
-          console.warn(
-            `[cacheService] Digest mismatch from S3 cold storage for hash ${hash}`
-          );
+          const s3MismatchMessage = [
+            '[cacheService] Digest mismatch from S3 cold storage for hash',
+            hash,
+          ].join(' ');
+          console.warn(s3MismatchMessage);
         }
       }
     }

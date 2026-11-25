@@ -19,6 +19,15 @@ import compilationCacheService, {
   computeCacheKey,
 } from './compiler/cacheService.js';
 
+const DEFAULT_RUST_VERSION = process.env.RUSTC_VERSION ?? '1.80.0';
+
+const DEFAULT_OPTIMIZATION_FLAGS = [
+  '--release',
+  ...(process.env.COMPILE_OPTIMIZATION_FLAGS
+    ? process.env.COMPILE_OPTIMIZATION_FLAGS.split(/\s+/).filter(Boolean)
+    : []),
+];
+
 // Cache integration using the shared redisService singleton.
 const COMPILE_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const CACHE_KEY_PREFIX = 'compile:cache:';
@@ -295,6 +304,46 @@ export function hashSource(code, dependencies = {}) {
     .digest('hex');
 }
 
+/**
+ * Derive the BE-11 compilation cache key from the full compile job context.
+ *
+ * This is the entrypoint that decides whether a compile job is a cache hit.
+ * It intentionally mirrors `computeCacheKey()`'s multi-input contract so that
+ * changes to helper source files, dependencies / Cargo.lock, the Rust version,
+ * and optimization flags all invalidate the cache key — not just the root
+ * `code` blob.
+ *
+ * The route layer is the source of truth for project-file discovery; when a
+ * request only supplies a single `code` string (the legacy playground API),
+ * we collapse the workspace inputs down to that single file so the key is a
+ * true content-address of the payload we actually compiled.
+ */
+export function computeCompileCacheKey(
+  job,
+  { rustVersion, optimizationFlags } = {}
+) {
+  const sourceFiles = job.sourceFiles || {};
+
+  if (Object.keys(sourceFiles).length === 0 && typeof job.code === 'string') {
+    // Legacy single-file compile request: treat the supplied code as the
+    // only source file so the cache key stays content-addressed.
+    sourceFiles['src/lib.rs'] = job.code;
+  }
+
+  const cargoLock =
+    job.cargoLock ??
+    buildCargoToml(job.dependencies || {})
+      .replace(/\s*\n\s*/g, '\n')
+      .trim();
+
+  return computeCacheKey({
+    sourceFiles,
+    cargoLock,
+    rustVersion: rustVersion ?? job.rustVersion ?? '',
+    optimizationFlags: optimizationFlags ?? job.optimizationFlags ?? [],
+  });
+}
+
 async function readState() {
   try {
     return JSON.parse(await fs.readFile(STATE_FILE, 'utf8'));
@@ -484,7 +533,12 @@ const workerPool = new WorkerPool(MAX_WORKERS);
 
 export async function compile(job) {
   validateCompileJob(job);
-  const hash = hashSource(job.code, job.dependencies || {});
+
+  // BE-11: derive the cache key from the full compilation context, not only
+  // the root `code` blob. This is what closes the stale-cache gap reported in
+  // #2025 for helper modules, Cargo.lock / dependencies, Rust version, and
+  // optimization flags.
+  const hash = computeCompileCacheKey(job);
 
   // ── BE-11: content-addressed cache lookup (S3 + Redis + LRU) ──────────────
   try {
@@ -521,8 +575,26 @@ export async function compile(job) {
   }
 
   const cargoToml = job.cargoToml || buildCargoToml(job.dependencies || {});
+
   const result = await executeUnderLock(hash, job.requestId, async () => {
-    return workerPool.run({ ...job, cargoToml, hash, cacheRoot: CACHE_ROOT });
+    return workerPool.run({
+      ...job,
+      cargoToml,
+      hash,
+      cacheRoot: CACHE_ROOT,
+      // Pass the same cache-key inputs into the worker so the rare code path
+      // that recomputes a key inside the worker still matches the entrypoint.
+      _cacheInputs: {
+        sourceFiles:
+          job.sourceFiles ||
+          (Object.keys(job.dependencies || {}).length
+            ? { 'src/lib.rs': job.code }
+            : { 'src/lib.rs': job.code }),
+        cargoLock: job.cargoLock || cargoToml,
+        rustVersion: job.rustVersion ?? DEFAULT_RUST_VERSION,
+        optimizationFlags: job.optimizationFlags ?? DEFAULT_OPTIMIZATION_FLAGS,
+      },
+    });
   });
 
   if (result?.success) {
@@ -651,6 +723,7 @@ export { workerPool, queueBus as compileProgressBus, compilationCacheService };
 export const compileService = {
   validateCompileJob,
   hashSource,
+  computeCompileCacheKey,
   compile,
   compileQueued,
   compileBatch,

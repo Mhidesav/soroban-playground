@@ -37,15 +37,24 @@ const {
   CompilationCacheService,
 } = require('../src/services/compiler/cacheService.js');
 
+// Keep a stable reference to jest even after `globalThis.jest` is rewritten
+// by the babel transform at runtime.
+const jestScope = globalThis.jest ?? jest;
+
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
 function makeInputs(overrides = {}) {
   return {
     sourceFiles: {
-      'src/lib.rs': '#![no_std]\npub fn add(a: u64) -> u64 { a }',
+      'src/lib.rs':
+        '#![no_std]\
+pub fn add(a: u64) -> u64 { a }',
     },
     cargoLock:
-      'version = 3\n[[package]]\nname = "soroban-sdk"\nversion = "20.0.0"',
+      'version = 3\
+[[package]]\
+name = "soroban-sdk"\
+version = "20.0.0"',
     rustVersion: '1.80.0',
     optimizationFlags: ['--release'],
     ...overrides,
@@ -71,12 +80,12 @@ function makeRedisMock() {
   return {
     isFallbackMode: false,
     client: {},
-    get: jest.fn(async (key) => store.get(key) ?? null),
-    set: jest.fn(async (key, value) => {
+    get: jestScope.fn(async (key) => store.get(key) ?? null),
+    set: jestScope.fn(async (key, value) => {
       store.set(key, value);
       return 'OK';
     }),
-    delete: jest.fn(async (key) => {
+    delete: jestScope.fn(async (key) => {
       store.delete(key);
       return 1;
     }),
@@ -239,7 +248,7 @@ describe('CompilationCacheService', () => {
   let svc;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    jestScope.clearAllMocks();
     svc = makeSvc();
   });
 
@@ -436,7 +445,7 @@ describe('CompilationCacheService', () => {
       };
 
       // Redis returns metadata
-      svc._redisOverride.get = jest
+      svc._redisOverride.get = jestScope
         .fn()
         .mockResolvedValue(JSON.stringify(entry));
       // S3 send returns WASM body for GetObject
@@ -450,7 +459,7 @@ describe('CompilationCacheService', () => {
     });
 
     it('falls through to miss when Redis returns malformed JSON', async () => {
-      svc._redisOverride.get = jest.fn().mockResolvedValue('{bad json}}}');
+      svc._redisOverride.get = jestScope.fn().mockResolvedValue('{bad json}}}');
       const hash = computeCacheKey(makeInputs());
       const result = await svc.lookup(hash);
       expect(result.hit).toBe(false);
@@ -629,7 +638,7 @@ describe('CompilationCacheService', () => {
       mockSend.mockRejectedValue(err);
 
       // No Redis entry, no LRU entry → falls through to S3 cold path
-      svc._redisOverride.get = jest.fn().mockResolvedValue(null);
+      svc._redisOverride.get = jestScope.fn().mockResolvedValue(null);
       const result = await svc.lookup('cold-miss-hash');
       expect(result.hit).toBe(false);
     });
@@ -653,7 +662,7 @@ describe('CompilationCacheService', () => {
       };
 
       // Redis returns valid metadata; S3 returns tampered WASM
-      svc._redisOverride.get = jest
+      svc._redisOverride.get = jestScope
         .fn()
         .mockResolvedValue(JSON.stringify(entry));
       mockSend.mockResolvedValueOnce({ Body: bufferToReadable(tamperedWasm) });
@@ -673,11 +682,88 @@ describe('CompilationCacheService', () => {
     });
   });
 
+  // ── cache key includes non-root source files ─────────────────────────────
+
+  describe('cache invalidation when non-root source files change', () => {
+    it('produces a different cache key when a non-root helper module changes', () => {
+      const base = makeInputs({
+        sourceFiles: {
+          'src/lib.rs':
+            'pub mod helper;\
+fn f() {}',
+          'src/helper.rs': 'pub fn helper() -> u64 { 1 }',
+        },
+      });
+      const mutated = makeInputs({
+        sourceFiles: {
+          'src/lib.rs':
+            'pub mod helper;\
+fn f() {}',
+          'src/helper.rs': 'pub fn helper() -> u64 { 2 }',
+        },
+      });
+      expect(computeCacheKey(base)).not.toBe(computeCacheKey(mutated));
+    });
+
+    it('produces a different cache key when only a non-root file changes', () => {
+      const before = makeInputs({
+        sourceFiles: {
+          'src/lib.rs': 'pub mod util;',
+          'src/util.rs': 'pub const X: u64 = 1;',
+        },
+      });
+      const after = makeInputs({
+        sourceFiles: {
+          'src/lib.rs': 'pub mod util;',
+          'src/util.rs': 'pub const X: u64 = 2;',
+        },
+      });
+      expect(computeCacheKey(before)).not.toBe(computeCacheKey(after));
+    });
+
+    it('still matches when only the root file changes in the same way as before', () => {
+      const a = makeInputs({
+        sourceFiles: {
+          'src/lib.rs': 'pub mod util;',
+          'src/util.rs': 'pub const X: u64 = 1;',
+        },
+      });
+      const b = makeInputs({
+        sourceFiles: {
+          'src/lib.rs': 'pub mod util;',
+          'src/util.rs': 'pub const X: u64 = 1;',
+        },
+      });
+      expect(computeCacheKey(a)).toBe(computeCacheKey(b));
+    });
+  });
+
+  // ── digest mismatch logging sites are reachable ─────────────────────────
+
+  describe('digest mismatch log paths are exercised', () => {
+    it('increments digestFailures and evicts on an LRU digest mismatch', async () => {
+      svc.s3Enabled = false;
+      svc._redisOverride.get = jestScope.fn().mockResolvedValue(null);
+
+      const hash = computeCacheKey(makeInputs());
+      await svc.store(hash, makeWasm('clean'));
+
+      const entry = svc.lru.get(hash);
+      entry.wasmBytes = makeWasm('tampered');
+      svc.lru.set(hash, entry);
+
+      const result = await svc.lookup(hash);
+      expect(result.hit).toBe(false);
+      expect(svc.getStats().digestFailures).toBe(1);
+      expect(svc.getStats().misses).toBeGreaterThanOrEqual(1);
+    });
+  });
+
   // ── Redis unavailable fallback ────────────────────────────────────────────
 
   describe('Redis unavailable fallback', () => {
     it('still serves LRU hits when Redis set throws', async () => {
-      svc._redisOverride.set = jest
+      svc._redisOverride.set = jestScope
         .fn()
         .mockRejectedValue(new Error('Redis timeout'));
 
@@ -691,7 +777,7 @@ describe('CompilationCacheService', () => {
     });
 
     it('returns a miss gracefully when Redis throws on lookup', async () => {
-      svc._redisOverride.get = jest
+      svc._redisOverride.get = jestScope
         .fn()
         .mockRejectedValue(new Error('Redis timeout'));
       const result = await svc.lookup('no-such-hash');
